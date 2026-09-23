@@ -9,6 +9,8 @@ from PyQt6.QtMultimedia import QAudioFormat, QAudioSource, QMediaDevices
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import QApplication, QPushButton
 
+from desktop_agent.agent import ask
+
 SAMPLE_RATE = 16000  # what whisper expects
 MODEL_SIZE = "base.en"
 SIZE = 56  # idle circle diameter / capsule height
@@ -132,7 +134,13 @@ class MicButton(QPushButton):
             self.transcribed.emit("[model still loading, try again]")
             return
         segments, _ = self.model.transcribe(audio, vad_filter=True)
-        self.transcribed.emit(" ".join(s.text.strip() for s in segments))
+        text = " ".join(s.text.strip() for s in segments)
+        self.transcribed.emit(text)
+        if text:
+            try:
+                self.transcribed.emit(ask(text))
+            except Exception as e:  # ollama down, model missing, etc.
+                self.transcribed.emit(f"[agent error: {e}]")
 
     def on_text(self, text):
         print(text, flush=True)

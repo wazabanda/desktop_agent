@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show *)",
+      "Bash(ollama list *)",
+      "Bash(curl -s localhost:11434/api/tags)"
+    ]
+  }
+}
