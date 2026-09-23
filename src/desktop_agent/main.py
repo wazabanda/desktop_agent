@@ -1,13 +1,15 @@
+import json
+import subprocess
 import sys
 import threading
 from collections import deque
 
 import numpy as np
-from PyQt6.QtCore import QByteArray, QEasingCurve, QRectF, Qt, QVariantAnimation, pyqtSignal
+from PyQt6.QtCore import QByteArray, QEasingCurve, QRectF, Qt, QTimer, QVariantAnimation, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtMultimedia import QAudioFormat, QAudioSource, QMediaDevices
 from PyQt6.QtSvg import QSvgRenderer
-from PyQt6.QtWidgets import QApplication, QPushButton
+from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
 
 from desktop_agent.agent import ask
 
@@ -18,6 +20,12 @@ WIDE = 220  # capsule width while recording
 BAR_W, GAP = 4, 2
 BARS = (WIDE - 32) // (BAR_W + GAP)
 WAVE_GAIN = 8  # calibration knob: raise if bars barely move with your mic, lower if they max out
+BUBBLE_W, BUBBLE_H = 360, 160
+BUBBLE_LINES = 6  # messages kept in the bubble
+BUBBLE_HIDE_MS = 15000
+BUBBLE_GAP = 8  # px between bubble and mic
+FOLLOW_MS = 250  # how often the visible bubble re-checks the mic position
+MIC_TITLE, BUBBLE_TITLE = "desktop-agent-mic", "desktop-agent-bubble"
 
 # Lucide "mic" icon (ISC license)
 MIC_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white"
@@ -27,7 +35,7 @@ MIC_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="
 
 
 class MicButton(QPushButton):
-    transcribed = pyqtSignal(str)
+    said = pyqtSignal(str)  # transcript, progress updates and replies, for the bubble
 
     def __init__(self):
         super().__init__()
@@ -35,6 +43,7 @@ class MicButton(QPushButton):
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowTitle(MIC_TITLE)  # the bubble finds us by this in `niri msg windows`
         # ponytail: window stays WIDE so the compositor keeps it centered; the shape animates inside it
         self.setFixedSize(WIDE, SIZE)
         self.mic = QSvgRenderer(QByteArray(MIC_SVG))
@@ -46,7 +55,6 @@ class MicButton(QPushButton):
         self.anim.valueChanged.connect(self._set_pill_w)
         self._set_pill_w(SIZE)
         self.clicked.connect(self.toggle)
-        self.transcribed.connect(self.on_text)
 
         fmt = QAudioFormat()
         fmt.setSampleRate(SAMPLE_RATE)
@@ -131,19 +139,92 @@ class MicButton(QPushButton):
 
     def _transcribe(self, audio):
         if self.model is None:
-            self.transcribed.emit("[model still loading, try again]")
+            self.said.emit("[model still loading, try again]")
             return
         segments, _ = self.model.transcribe(audio, vad_filter=True)
         text = " ".join(s.text.strip() for s in segments)
-        self.transcribed.emit(text)
-        if text:
-            try:
-                self.transcribed.emit(ask(text))
-            except Exception as e:  # ollama down, model missing, etc.
-                self.transcribed.emit(f"[agent error: {e}]")
+        if not text:
+            return
+        self.said.emit(f"› {text}")
+        try:
+            self.said.emit(ask(text, self.said.emit))
+        except Exception as e:  # ollama down, model missing, etc.
+            self.said.emit(f"[agent error: {e}]")
 
-    def on_text(self, text):
+
+class Bubble(QLabel):
+    """Chat bubble above the mic: rolling log of the last few messages, auto-hides when idle."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowTitle(BUBBLE_TITLE)  # niri-setup.sh matches this title
+        # ponytail: fixed size because niri anchors floating windows top-left, a growing window
+        # would slide over the mic; long text is clipped at the top, swap for QTextEdit if that bites
+        self.setFixedSize(BUBBLE_W, BUBBLE_H)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setWordWrap(True)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom)
+        self.setContentsMargins(16, 12, 16, 12)
+        self.setStyleSheet("color: white; font-size: 13px;")
+        self.lines = deque(maxlen=BUBBLE_LINES)
+        self.hider = QTimer(self)
+        self.hider.setSingleShot(True)
+        self.hider.setInterval(BUBBLE_HIDE_MS)
+        self.hider.timeout.connect(self.hide)
+        # ponytail: polls niri every FOLLOW_MS while visible; niri's event-stream if polling ever shows up in top
+        self.follower = QTimer(self)
+        self.follower.setInterval(FOLLOW_MS)
+        self.follower.timeout.connect(self._follow_mic)
+        self.hider.timeout.connect(self.follower.stop)
+
+    def say(self, text):
         print(text, flush=True)
+        self.lines.append(text)
+        self.setText("\n\n".join(self.lines))
+        self.show()
+        self.hider.start()
+        self.follower.start()  # first tick also catches the window once niri has mapped it
+
+    def _follow_mic(self):
+        # Wayland hides window positions from clients, so ask niri over its IPC
+        try:
+            out = subprocess.run(["niri", "msg", "--json", "windows"], capture_output=True, timeout=1).stdout
+            ours = {w["title"]: w for w in json.loads(out) if w["app_id"] == "desktop-agent"}
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return  # not on niri: stay where the window rule put it
+        mic, bubble = ours.get(MIC_TITLE), ours.get(BUBBLE_TITLE)
+        if not mic or not bubble or not bubble["is_floating"]:
+            return
+        mic_pos = mic["layout"]["tile_pos_in_workspace_view"]
+        if mic_pos is None:  # mic tiled or on another workspace
+            return
+        (mx, my), (mw, _) = mic_pos, mic["layout"]["tile_size"]
+        (bx, by), (bw, bh) = bubble["layout"]["tile_pos_in_workspace_view"], bubble["layout"]["tile_size"]
+        # relative move: absolute move coords exclude bars (working area), window-list coords don't
+        dx, dy = round(mx + (mw - bw) / 2 - bx), round(my - bh - BUBBLE_GAP - by)
+        if dx or dy:
+            subprocess.run(
+                ["niri", "msg", "action", "move-floating-window", "--id", str(bubble["id"]), f"-x={dx:+}", f"-y={dy:+}"],
+                capture_output=True, timeout=1,
+            )
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        p.fillRect(self.rect(), Qt.GlobalColor.transparent)  # wipe last frame
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(40, 40, 40, 235))
+        p.drawRoundedRect(QRectF(self.rect()), 16, 16)
+        p.end()
+        super().paintEvent(event)
 
 
 def main() -> None:
@@ -151,6 +232,8 @@ def main() -> None:
     #Wayland ignores move(); on niri a window-rule on this app-id floats it bottom-center.
     app.setDesktopFileName("desktop-agent")
     button = MicButton()
+    bubble = Bubble()
+    button.said.connect(bubble.say)
     button.show()
     button.place()
     print("UI initialized", flush=True)

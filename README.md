@@ -17,10 +17,10 @@ Early work in progress.
 |---|---|
 | Floating mic button (PyQt6) with live waveform | ✅ done |
 | Local speech-to-text (faster-whisper `base.en`, CPU int8) | ✅ done |
-| Agent loop over Ollama | ✅ done, no tools yet |
+| Agent loop over Ollama | ✅ done, `print_to_ui` tool only |
 | niri window rule setup | ✅ done |
 | Tools: open apps, niri control, system info, search, safe bash | 🚧 planned |
-| Showing responses in the UI (currently printed to stdout) | 🚧 planned |
+| Chat bubble above the mic for transcript, progress and replies | ✅ done |
 
 ## Requirements
 
@@ -42,7 +42,7 @@ ollama pull gemma4:e4b
 ./scripts/niri-setup.sh
 ```
 
-`niri-setup.sh` backs up `~/.config/niri/config.kdl`, adds a `window-rule` for app-id `desktop-agent`, and restores the backup if `niri validate` fails. It is safe to re-run.
+`niri-setup.sh` backs up `~/.config/niri/config.kdl`, adds `window-rule`s for app-id `desktop-agent` (mic at bottom center, bubble just above it), and restores the backup if `niri validate` fails. It is safe to re-run.
 
 ## Usage
 
@@ -50,7 +50,7 @@ ollama pull gemma4:e4b
 uv run desktop-agent
 ```
 
-Click the mic, speak, then click again to stop. The transcript and the agent's reply are printed to stdout. The Whisper model loads in the background at startup, so the first click might report that it is still loading.
+Click the mic, speak, then click again to stop. The transcript, any progress updates the agent sends with its `print_to_ui` tool, and the final reply show up in a chat bubble above the mic (also echoed to stdout). The bubble keeps the last few messages and hides after 15s of quiet. It follows the mic if you drag it somewhere else (tracked through `niri msg`). The Whisper model loads in the background at startup, so the first click might report that it is still loading.
 
 To try the agent without voice:
 

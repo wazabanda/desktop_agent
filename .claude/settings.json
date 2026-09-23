@@ -3,7 +3,14 @@
     "allow": [
       "Bash(pip show *)",
       "Bash(ollama list *)",
-      "Bash(curl -s localhost:11434/api/tags)"
+      "Bash(curl -s localhost:11434/api/tags)",
+      "Bash(QT_QPA_PLATFORM=offscreen uv run python -c ' *)",
+      "Bash(cp ~/.config/niri/config.kdl niri/)",
+      "Bash(XDG_CONFIG_HOME=__TRACKED_VAR__ bash /home/wazab/Dev/Github/desktop_agent/scripts/niri-setup.sh)",
+      "Bash(cp ~/.config/niri/*.kdl niri/)",
+      "Bash(niri msg *)",
+      "Bash(python -c \"import json,sys; [print\\(json.dumps\\(w\\)\\) for w in json.load\\(sys.stdin\\)[:2]]\")",
+      "Bash(python -)"
     ]
   }
 }
