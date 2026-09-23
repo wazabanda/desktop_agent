@@ -1,7 +1,7 @@
 [project]
 name = "desktop-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "Voice-driven local desktop agent for the niri Wayland compositor"
 readme = "README.md"
 authors = [
     { name = "wazabanda", email = "1wazabanda@gmail.com" }
