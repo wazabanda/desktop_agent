@@ -1,0 +1,22 @@
+[project]
+name = "desktop-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "wazabanda", email = "1wazabanda@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "faster-whisper>=1.2.1",
+    "openai>=3.19.0",
+    "pydantic-ai>=2.48.0",
+    "pyqt6>=6.11.0",
+]
+
+[project.scripts]
+desktop-agent = "desktop_agent.main:main"
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
