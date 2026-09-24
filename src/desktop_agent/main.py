@@ -9,9 +9,11 @@ from PyQt6.QtCore import QByteArray, QEasingCurve, QRectF, Qt, QTimer, QVariantA
 from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtMultimedia import QAudioFormat, QAudioSource, QMediaDevices
 from PyQt6.QtSvg import QSvgRenderer
-from PyQt6.QtWidgets import QApplication, QLabel, QPushButton
+from PyQt6.QtWidgets import (
+    QApplication, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QMenu, QPushButton,
+)
 
-from desktop_agent.agent import ask
+from desktop_agent.agent import PROVIDERS, ask, load_settings, save_settings
 
 SAMPLE_RATE = 16000  # what whisper expects
 MODEL_SIZE = "base.en"
@@ -26,6 +28,7 @@ BUBBLE_HIDE_MS = 15000
 BUBBLE_GAP = 8  # px between bubble and mic
 FOLLOW_MS = 250  # how often the visible bubble re-checks the mic position
 MIC_TITLE, BUBBLE_TITLE = "desktop-agent-mic", "desktop-agent-bubble"
+SETTINGS_TITLE = "desktop-agent-settings"
 
 # Lucide "mic" icon (ISC license)
 MIC_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white"
@@ -118,6 +121,12 @@ class MicButton(QPushButton):
             self.levels.append(min(1.0, float(np.sqrt(np.mean(samples**2))) * WAVE_GAIN))
             self.update()
 
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        menu.addAction("Settings…", lambda: Settings().exec())
+        menu.addAction("Quit", QApplication.quit)
+        menu.exec(event.globalPos())
+
     def place(self):
         geo = self.screen().availableGeometry()
         self.move(geo.center().x() - self.width() // 2, geo.bottom() - self.height() - 20)
@@ -150,6 +159,49 @@ class MicButton(QPushButton):
             self.said.emit(ask(text, self.said.emit))
         except Exception as e:  # ollama down, model missing, etc.
             self.said.emit(f"[agent error: {e}]")
+
+
+class Settings(QDialog):
+    """Provider, model and per-provider API keys, saved to agent.SETTINGS."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(SETTINGS_TITLE)  # niri-setup.sh matches this title
+        self.s = load_settings()
+        form = QFormLayout(self)
+        self.provider = QComboBox()
+        self.provider.addItems(PROVIDERS)
+        self.model = QComboBox()
+        self.model.setEditable(True)  # any model name, not just the suggestions
+        self.keys = {}
+        form.addRow("Provider", self.provider)
+        form.addRow("Model", self.model)
+        for p in PROVIDERS:
+            if p == "ollama":
+                continue  # local, no key
+            self.keys[p] = QLineEdit(self.s["keys"].get(p, ""))
+            self.keys[p].setEchoMode(QLineEdit.EchoMode.Password)
+            form.addRow(f"{p} API key", self.keys[p])
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self.provider.currentTextChanged.connect(self._suggest)
+        self.provider.setCurrentText(self.s["provider"])
+        self._suggest(self.s["provider"])
+        self.model.setCurrentText(self.s["model"])
+        self.setMinimumWidth(380)
+
+    def _suggest(self, provider):
+        self.model.clear()
+        self.model.addItems(PROVIDERS[provider])
+
+    def accept(self):
+        self.s["provider"] = self.provider.currentText()
+        self.s["model"] = self.model.currentText().strip() or PROVIDERS[self.s["provider"]][0]
+        self.s["keys"] = {p: e.text().strip() for p, e in self.keys.items() if e.text().strip()}
+        save_settings(self.s)
+        super().accept()
 
 
 class Bubble(QLabel):

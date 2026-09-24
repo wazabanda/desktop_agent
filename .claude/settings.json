@@ -10,7 +10,9 @@
       "Bash(cp ~/.config/niri/*.kdl niri/)",
       "Bash(niri msg *)",
       "Bash(python -c \"import json,sys; [print\\(json.dumps\\(w\\)\\) for w in json.load\\(sys.stdin\\)[:2]]\")",
-      "Bash(python -)"
+      "Bash(python -)",
+      "Bash(grep -hE \"^\\(Keywords|GenericName\\)=\" /usr/share/applications/code.desktop /usr/share/applications/firefox.desktop /usr/share/applications/*lacritty*.desktop 2>/dev/null)",
+      "Read(//usr/share/applications/**)"
     ]
   }
 }

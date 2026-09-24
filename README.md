@@ -17,9 +17,10 @@ Early work in progress.
 |---|---|
 | Floating mic button (PyQt6) with live waveform | ✅ done |
 | Local speech-to-text (faster-whisper `base.en`, CPU int8) | ✅ done |
-| Agent loop over Ollama | ✅ done, `print_to_ui` tool only |
+| Agent loop over Ollama | ✅ done |
+| Tool: `open_app` (launch installed apps by spoken name) | ✅ done |
 | niri window rule setup | ✅ done |
-| Tools: open apps, niri control, system info, search, safe bash | 🚧 planned |
+| Tools: niri control, system info, search, safe bash | 🚧 planned |
 | Chat bubble above the mic for transcript, progress and replies | ✅ done |
 
 ## Requirements
@@ -71,6 +72,8 @@ uv run python -m desktop_agent.agent "what's using the most memory?"
 src/desktop_agent/
   main.py    # Qt mic button, audio capture, whisper transcription
   agent.py   # pydantic-ai agent + tools
+tests/
+  test_find_app.py  # app-name matching, run with `uv run python tests/test_find_app.py`
 scripts/
   niri-setup.sh  # installs the niri window rule
 ```
@@ -78,3 +81,7 @@ scripts/
 ## Safety
 
 The agent acts on your real machine, so shell access is limited by design. The planned bash tool checks every command against an allow/deny list in code before it runs. Destructive operations, privilege escalation and writes outside expected locations get blocked there, so the model can't talk its way around the check. Keep this in mind when you add tools: a new tool should expose the narrowest capability that does the job.
+
+## AI disclosure
+
+This project was built with help from AI. [Claude Code](https://claude.com/claude-code) (Anthropic's Claude) was used to write and edit parts of the code and documentation. All changes were reviewed by the author.

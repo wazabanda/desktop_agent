@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Adds (or refreshes) niri window-rules that float the desktop-agent mic button at
-# bottom center with a transparent background, and its chat bubble just above it. Safe to re-run.
+# bottom center with a transparent background, its chat bubble just above it, and its settings dialog. Safe to re-run.
 set -euo pipefail
 
 config="${XDG_CONFIG_HOME:-$HOME/.config}/niri/config.kdl"
 mic_marker="// desktop-agent mic button"
 bubble_marker="// desktop-agent chat bubble"
+settings_marker="// desktop-agent settings dialog"
 
 cp "$config" "$config.bak"
 # drop any previous version of the rules (marker comment through its closing brace)
-for marker in "$mic_marker" "$bubble_marker"; do
+for marker in "$mic_marker" "$bubble_marker" "$settings_marker"; do
     sed -i "\|^$marker|,/^}/d" "$config"
 done
-# the bubble rule comes last so its position overrides the mic rule, which also matches it
+# the bubble/settings rules come last so they override the mic rule, which also matches them
 cat >> "$config" <<EOF
 $mic_marker: float at bottom center, transparent, don't steal focus
 window-rule {
@@ -28,6 +29,12 @@ $bubble_marker: sits above the mic (mic is 56px tall at y=20)
 window-rule {
     match app-id="^desktop-agent\$" title="^desktop-agent-bubble\$"
     default-floating-position x=0 y=88 relative-to="bottom"
+}
+$settings_marker: needs focus for typing, opens near the top
+window-rule {
+    match app-id="^desktop-agent\$" title="^desktop-agent-settings\$"
+    open-focused true
+    default-floating-position x=0 y=100 relative-to="top"
 }
 EOF
 
