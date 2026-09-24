@@ -2,6 +2,7 @@
 media players via MPRIS."""
 
 import json
+import re
 import subprocess
 import time
 from urllib.parse import urlparse
@@ -16,7 +17,40 @@ from gi.repository import Atspi, Gio, GLib  # noqa: E402
 toolset = FunctionToolset()
 OURS = "desktop-agent"  # our own app-id: never a target for keys
 KEY_DELAY = 0.008  # s between key events; raise if apps drop characters
+FOCUS_CHECK_EVERY = 4  # chars between "still in the target window?" checks (~5ms niri IPC each)
 MAX_ELEMENTS, MAX_VISITED = 150, 4000  # caps on list_elements output and tree walk cost
+
+# ponytail: regex denylist, catches the obvious forms only; obfuscated commands (base64, variables,
+# aliases) get through. A real sandbox or confirm-before-Enter is the upgrade if that matters.
+DANGEROUS_TEXT = re.compile("|".join([
+    r"\brm\s", r"\brmdir\b", r"\bshred\b", r"\bunlink\b", r"\btruncate\b", r"\bwipefs\b",  # delete files
+    r"\bmkfs", r"\bdd\s.*\bof=", r"\b(fdisk|sfdisk|gdisk|sgdisk|parted)\b", r">\s*/dev/(sd|nvme|hd|vd|mmcblk)",
+    r"\bfind\b.*\s-delete\b", r"\bfind\b.*-exec\s+rm\b", r"\bmv\s.*\s/dev/null\b",
+    r"\b(sudo|doas|pkexec)\b", r"\bsu\s+-?\s*$|\bsu\s+root\b",  # privilege escalation
+    r"\bchmod\s+(-\S+\s+)*(-R|777)\b", r"\bchown\s+(-\S+\s+)*-R\b",
+    r":\(\)\s*\{",  # fork bomb
+    r"\b(curl|wget)\b.*\|\s*(sudo\s+)?(ba|z|da)?sh\b",  # pipe to shell
+    r"\bgit\s+(push\s.*(--force|-f\b)|reset\s+--hard|clean\s+-\S*f)",
+    r"\b(shutdown|reboot|poweroff|halt)\b", r"\bsystemctl\s+(stop|disable|mask|kill)\b", r"\bkill(all)?\s+-9\b",
+    r"\bpacman\s+-R", r"\b(apt|apt-get|dnf|yum|zypper)\s+(remove|purge|autoremove|erase)\b",
+    r"\bcrontab\s+-r\b", r"\bhistory\s+-c\b",
+    r"\b(drop|truncate)\s+(table|database|schema)\b", r"\bdelete\s+from\b",  # SQL
+    r"\bshutil\.rmtree\b", r"\bos\.(remove|unlink|rmdir|removedirs)\b", r"\.unlink\(", r"\.rmdir\(",  # Python
+    r"\bfs\.(rm|rmSync|unlink|unlinkSync|rmdir)\b", r"\brimraf\b",  # Node
+    r"\bRemove-Item\b", r"\bdel\s+/[sqf]\b", r"\bformat\s+[a-z]:",  # Windows
+]), re.IGNORECASE)
+DANGEROUS_KEYS = {"shift+delete", "ctrl+shift+delete"}  # permanent delete in file managers, clear browser data
+DANGEROUS_BUTTON = re.compile(
+    r"\b(delet|remov|eras|trash|discard|wipe|purg|destroy|uninstall|format|reset|clear|empty)\w*", re.IGNORECASE)
+
+
+class Dangerous(Exception):
+    """Raised from a tool to stop the whole agent run: the model asked for a risky command or click."""
+
+
+def _guard_text(text: str) -> None:
+    if m := DANGEROUS_TEXT.search(text):
+        raise Dangerous(f"text matching {m.group(0)!r}")
 
 
 # --- niri windows -------------------------------------------------------------------------------
@@ -138,9 +172,19 @@ def _combo(codes: list[int]) -> None:
         time.sleep(KEY_DELAY)
 
 
-def _type(text: str) -> None:
+def _check_focus(win: dict, done: int = 0) -> None:
+    """Abort if the user moved focus away mid-typing, so keys never land in the wrong window."""
+    focused = json.loads(_niri("--json", "focused-window"))
+    if not focused or focused["id"] != win["id"]:
+        # don't steal focus back: the user clicked away on purpose
+        raise RuntimeError(f"stopped after {done} chars: focus left {_label(win)}")
+
+
+def _type(text: str, win: dict) -> None:
     chars = [_char(c) for c in text]  # validate everything before typing anything
-    for code, shift in chars:
+    for i, (code, shift) in enumerate(chars):
+        if i % FOCUS_CHECK_EVERY == 0:
+            _check_focus(win, i)
         _combo([ecodes.KEY_LEFTSHIFT, code] if shift else [code])
 
 
@@ -148,9 +192,12 @@ def _type(text: str) -> None:
 def press_keys(keys: str, window_id: int | None = None) -> str:
     """Press key combos in a window, e.g. "ctrl+l", "ctrl+shift+t", "alt+left", "enter", or several
     separated by spaces: "ctrl+a delete". Default window: the one the user last used."""
+    if bad := DANGEROUS_KEYS & set(keys.lower().split()):
+        raise Dangerous(f"keys {bad.pop()!r}")
     combos = [[_key(k) for k in combo.split("+")] for combo in keys.split()]
     win = _target(window_id)
-    for codes in combos:
+    for i, codes in enumerate(combos):
+        _check_focus(win, i)
         _combo(codes)
     return f"Pressed {keys} in {_label(win)}"
 
@@ -158,8 +205,9 @@ def press_keys(keys: str, window_id: int | None = None) -> str:
 @toolset.tool_plain
 def type_text(text: str, window_id: int | None = None) -> str:
     """Type text into whatever has keyboard focus in a window. Default window: the one the user last used."""
+    _guard_text(text)
     win = _target(window_id)
-    _type(text)
+    _type(text, win)
     return f"Typed {len(text)} chars in {_label(win)}"
 
 
@@ -246,6 +294,8 @@ def _element(n: int) -> Atspi.Accessible:
 def click_element(n: int) -> str:
     """Click/press/activate element [n] from the last list_elements (buttons, links, tabs, menu items)."""
     el = _element(n)
+    if m := DANGEROUS_BUTTON.search(el.get_name() or ""):
+        raise Dangerous(f"click on {_describe(el)} ({m.group(0)!r})")
     _target(_last[0])
     if el.is_action() and el.get_n_actions() > 0:
         el.do_action(0)  # "click", "press", "jump"... whatever the element's primary action is
@@ -259,14 +309,16 @@ def click_element(n: int) -> str:
 def type_into(n: int, text: str, replace: bool = True) -> str:
     """Focus editable element [n] from the last list_elements and type text into it (replacing its content
     by default). Press enter afterwards with press_keys if the text should be submitted."""
+    _guard_text(text)
     el = _element(n)
-    _target(_last[0])
+    win = _target(_last[0])
     el.grab_focus()
     time.sleep(0.05)
     # real keystrokes, not EditableText.set_text_contents: web apps (React etc.) ignore silent value changes
     if replace:
+        _check_focus(win)
         _combo([ecodes.KEY_LEFTCTRL, ecodes.KEY_A])
-    _type(text)
+    _type(text, win)
     return f"Typed into {_describe(el)}"
 
 

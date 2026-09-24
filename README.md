@@ -26,7 +26,9 @@ Early work in progress.
 | Tools: app UI via accessibility tree (`list_elements`, `click_element`, `type_into`) | ✅ done |
 | Conversation memory across requests (last 20, reset from the right-click menu) | ✅ done |
 | Screenshot + numbered-box fallback for apps without an accessibility tree | 🚧 planned |
-| Tools: system info, search, safe bash | 🚧 planned |
+| Tools: web search (`duckduckgo_search`, `web_fetch`), local files (`read_file`) | ✅ done |
+| Guardrail: dangerous commands/code (`rm`, `sudo`, `dd`, `rmtree`, `DROP TABLE`...) and Delete/Remove/Erase-style buttons stop the run (`DANGEROUS_*` in `desktop.py`) | ✅ done |
+| Tools: system info, safe bash | 🚧 planned |
 | Chat bubble above the mic for transcript, progress and replies | ✅ done |
 | Replies read aloud with local Kokoro TTS (toggle in Settings) | ✅ done |
 
@@ -86,6 +88,7 @@ tests/
   test_keys.py      # key-name / character mapping
   test_history.py   # conversation memory and trimming (stub model, no LLM needed)
   test_wake.py      # wake-phrase queue matching
+  test_silence.py   # auto-stop on silence/static
 scripts/
   niri-setup.sh  # installs the niri window rule
 ```
@@ -97,7 +100,8 @@ Turn on **Always listening** in Settings (right-click the mic) and set a wake ph
 - The mic stays open, and every 2 seconds whisper transcribes the last 2.5s locally. Quiet stretches are skipped, so it uses almost no CPU while the room is silent.
 - The words go into a small rolling queue. When the queue contains your phrase, recording starts, the same as clicking. The match is on letters, so "Hi, Bitz" or "hibits" still count, and a phrase split across two windows is caught.
 - **Nothing is sent to the LLM until the wake phrase is heard.** Only the recording after it goes to the agent.
-- A wake-started recording stops by itself 1.5s after you stop talking. It also stops after 5s if you say nothing, or after 30s at most. Clicked recordings still wait for a second click.
+- A wake-started recording stops by itself 1.5s after you stop talking. It also stops after 5s if you say nothing, or after 30s at most. Clicked recordings stop on a second click, or by themselves after 10s without speech (`CLICKED_QUIET_S`).
+- "Speech" is decided by the Silero voice detector that ships with faster-whisper, not by loudness, so static, fan hum and silence all count as quiet. Tune it with `VAD_SPEECH`.
 - Wait for the mic to turn red before giving the command. Wake-up takes about half a second after the phrase.
 
 Tuning knobs at the top of `main.py`: `SPEECH_RMS` (raise it in a noisy room), `WAKE_MATCH` (lower it if you get missed wakes, raise it if you get false ones) and `END_SILENCE_S`.
@@ -114,7 +118,7 @@ With **Read replies aloud** on (the default), the final reply is spoken by [Koko
 
 ## Conversation memory
 
-The agent remembers the last 20 requests of the session, so follow-ups work: "write a hello world in vim" followed by "run the program" types `python3 hello.py` into the same terminal. Old tool output such as element lists is trimmed to its first lines; what the agent did and in which window is kept. Right-click the mic and pick **New conversation** to start fresh. Memory is not saved when the app quits.
+The agent remembers the last 20 requests of the session, so follow-ups work: "write a hello world in vim" followed by "run the program" types `python3 hello.py` into the same terminal. Old tool output such as element lists is trimmed to its first lines; what the agent did and in which window is kept. Right-click the mic and pick **New conversation**, or say "new session" (or any phrase set under **New conversation phrases** in Settings) to start fresh. Memory is not saved when the app quits.
 
 ## Operating apps
 

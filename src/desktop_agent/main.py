@@ -38,6 +38,9 @@ WAKE_WINDOW_S, WAKE_HOP_S = 2.5, 2.0  # whisper looks at 2.5s of audio every 2s 
 WAKE_MATCH = 0.8  # 0..1 letter similarity to the phrase; lower if it misses you, raise on false wakes
 SPEECH_RMS = 0.01  # calibration knob: mic level counted as speech; raise in a noisy room
 END_SILENCE_S, NO_SPEECH_S, MAX_RECORD_S = 1.5, 5.0, 30.0  # auto-stop for wake-started recordings
+CLICKED_QUIET_S = 10.0  # clicked recordings stop after this long without speech (silence or static)
+VAD_BLOCK = 8192  # samples (~0.5s) per speech check; Silero needs a multiple of 512
+VAD_SPEECH = 0.5  # calibration knob: Silero speech probability; noise scores ~0.05, speech ~0.99
 FOLLOWUP_S = 10.0  # after a reply, listen this long for a follow-up before needing the wake phrase again
 GOODBYES = {"bye", "goodbye", "byebye", "thanksbye", "thankyoubye", "thatsall", "nevermind", "stop"}  # whole utterance
 BYTES_PER_S = SAMPLE_RATE * 2  # int16 mono
@@ -49,6 +52,13 @@ def _float(pcm: bytes) -> np.ndarray:
 
 def _rms(pcm: bytes) -> float:
     return float(np.sqrt(np.mean(_float(pcm) ** 2)))
+
+
+def _is_speech(pcm: bytes) -> bool:
+    """Silero voice detector (ships with faster-whisper, ~1ms on CPU): speech yes, silence/static/hum no."""
+    from faster_whisper.vad import get_vad_model  # cached after the first call
+
+    return float(get_vad_model()(_float(pcm)).max()) >= VAD_SPEECH
 
 
 def _word(w: str) -> str:
@@ -112,7 +122,7 @@ class MicButton(QPushButton):
         self.source = QAudioSource(QMediaDevices.defaultAudioInput(), fmt)
         self.buffer = None  # audio device while the mic is open (recording or listening)
         self.recording = False
-        self.auto_stop = False  # wake-started recordings end on silence
+        self.auto_stop = False  # wake-started: end 1.5s after speech; clicked: end after CLICKED_QUIET_S
         self.listening = False
         self.wake_pcm = bytearray()
         self.wake_busy = False
@@ -192,8 +202,7 @@ class MicButton(QPushButton):
             self.pcm.extend(chunk)
             self.levels.append(min(1.0, rms * WAVE_GAIN))
             self.update()
-            if self.auto_stop:
-                self._check_silence(len(chunk), rms)
+            self._check_silence(chunk)
         elif self.speaking:
             self.wake_pcm.clear()  # don't scan our own voice for the wake phrase
         elif self.listening:
@@ -220,15 +229,25 @@ class MicButton(QPushButton):
         finally:
             self.wake_busy = False
 
-    def _check_silence(self, nbytes: int, rms: float):
-        self.rec_bytes += nbytes
-        if rms >= SPEECH_RMS:
-            self.spoke, self.quiet = True, 0
+    def _check_silence(self, chunk: bytes):
+        # judged per ~0.5s block by a voice detector, not loudness, so static and hum count as quiet
+        self.vad_pcm.extend(chunk)
+        block = VAD_BLOCK * 2
+        while len(self.vad_pcm) >= block:
+            audio = bytes(self.vad_pcm[:block])
+            del self.vad_pcm[:block]
+            self.rec_bytes += block
+            if _is_speech(audio):
+                self.spoke, self.quiet = True, 0
+            else:
+                self.quiet += block
+        if not self.auto_stop:  # clicked: give time to think, but don't record static forever
+            done = self.quiet >= CLICKED_QUIET_S * BYTES_PER_S
         else:
-            self.quiet += nbytes
-        if ((self.spoke and self.quiet >= END_SILENCE_S * BYTES_PER_S)
-                or (not self.spoke and self.rec_bytes >= self.no_speech * BYTES_PER_S)
-                or self.rec_bytes >= MAX_RECORD_S * BYTES_PER_S):
+            done = ((self.spoke and self.quiet >= END_SILENCE_S * BYTES_PER_S)
+                    or (not self.spoke and self.rec_bytes >= self.no_speech * BYTES_PER_S)
+                    or self.rec_bytes >= MAX_RECORD_S * BYTES_PER_S)
+        if done:
             self._stop()
 
     def apply_settings(self):
@@ -275,6 +294,7 @@ class MicButton(QPushButton):
         tts.stop()  # clicking the mic interrupts the reply being read out
         self.recording, self.auto_stop, self.no_speech = True, auto_stop, no_speech
         self.pcm = bytearray()
+        self.vad_pcm = bytearray()
         self.rec_bytes = self.quiet = 0
         self.spoke = False
         self.levels.extend([0.0] * BARS)
@@ -302,6 +322,11 @@ class MicButton(QPushButton):
         if _goodbye(text):  # end the conversation turn: no agent call, no follow-up
             self.said.emit("bye 👋")
             self._say("Bye!")
+            return
+        if _said(text, load_settings()["clear_phrases"].split(",")):
+            forget()
+            self.said.emit("[new conversation]")
+            self._say("New conversation.")
             return
         try:
             reply = ask(text, self.said.emit)
@@ -335,9 +360,13 @@ def _preload_cublas():
         ctypes.CDLL(str(lib / name), mode=ctypes.RTLD_GLOBAL)
 
 
-def _goodbye(text: str) -> bool:
+def _said(text: str, phrases) -> bool:
     # ponytail: exact match on the whole utterance, so "stop the music" still reaches the agent
-    return "".join(map(_word, text.split())) in GOODBYES
+    return "".join(map(_word, text.split())) in {"".join(map(_word, p.split())) for p in phrases} - {""}
+
+
+def _goodbye(text: str) -> bool:
+    return _said(text, GOODBYES)
 
 
 def _playing() -> bool:
@@ -375,6 +404,9 @@ class Settings(QDialog):
         self.phrase.setPlaceholderText("hi bits")
         form.addRow(self.wake)
         form.addRow("Wake phrase", self.phrase)
+        self.clear = QLineEdit(self.s["clear_phrases"])
+        self.clear.setToolTip("Comma-separated. Saying one of these starts a new conversation.")
+        form.addRow("New conversation phrases", self.clear)
         self.speak = QCheckBox("Read replies aloud (downloads a ~340MB voice model once)")
         self.speak.setChecked(self.s["speak"])
         form.addRow(self.speak)
@@ -425,6 +457,7 @@ class Settings(QDialog):
         self.s["keys"] = {p: e.text().strip() for p, e in self.keys.items() if e.text().strip()}
         self.s["wake"] = self.wake.isChecked()
         self.s["wake_phrase"] = self.phrase.text().strip() or "hi bits"
+        self.s["clear_phrases"] = self.clear.text().strip()
         self.s["speak"] = self.speak.isChecked()
         self.s["voice"] = self.voice.currentText()
         self.s["gpu"] = self.gpu.isChecked()

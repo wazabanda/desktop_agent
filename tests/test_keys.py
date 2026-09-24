@@ -15,4 +15,16 @@ for bad in ("é", "€"):
         raise AssertionError(f"{bad!r} should be rejected")
     except ValueError:
         pass
+
+# typing aborts once focus leaves the target window
+import desktop_agent.desktop as d  # noqa: E402
+
+focus, typed = iter(['{"id": 1}', '{"id": 2}']), []
+d._niri = lambda *a: next(focus)
+d._combo = typed.append
+try:
+    d._type("abcdefgh", {"id": 1, "app_id": "x", "title": "t"})
+    raise AssertionError("should stop when focus moves")
+except RuntimeError as err:
+    assert "after 4 chars" in str(err) and len(typed) == d.FOCUS_CHECK_EVERY, (err, typed)
 print("ok")
