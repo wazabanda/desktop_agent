@@ -28,6 +28,7 @@ Early work in progress.
 | Screenshot + numbered-box fallback for apps without an accessibility tree | 🚧 planned |
 | Tools: system info, search, safe bash | 🚧 planned |
 | Chat bubble above the mic for transcript, progress and replies | ✅ done |
+| Replies read aloud with local Kokoro TTS (toggle in Settings) | ✅ done |
 
 ## Requirements
 
@@ -79,6 +80,7 @@ src/desktop_agent/
   main.py    # Qt mic button, audio capture, whisper transcription
   agent.py   # pydantic-ai agent, settings, open_app
   desktop.py # desktop tools: niri windows, uinput keyboard, AT-SPI elements
+  tts.py     # Kokoro text-to-speech, played with pw-play
 tests/
   test_find_app.py  # app-name matching, run with `uv run python tests/test_find_app.py`
   test_keys.py      # key-name / character mapping
@@ -99,6 +101,16 @@ Turn on **Always listening** in Settings (right-click the mic) and set a wake ph
 - Wait for the mic to turn red before giving the command. Wake-up takes about half a second after the phrase.
 
 Tuning knobs at the top of `main.py`: `SPEECH_RMS` (raise it in a noisy room), `WAKE_MATCH` (lower it if you get missed wakes, raise it if you get false ones) and `END_SILENCE_S`.
+
+## Spoken replies
+
+With **Read replies aloud** on (the default), the final reply is spoken by [Kokoro](https://github.com/thewh1teagle/kokoro-onnx), running locally. Progress updates are shown but not spoken. Replies are synthesized one sentence at a time, so speech starts after the first sentence instead of the whole reply. The first run downloads the model (~340MB) to `~/.cache/desktop-agent/`. Audio plays through `pw-play` (PipeWire).
+
+**Run speech models on the GPU** (Settings, on by default) puts both Whisper and Kokoro on an NVIDIA GPU. The CUDA libraries come from pip (`nvidia-*` wheels, ~2.5GB), so no system CUDA is needed. If CUDA won't start, both fall back to the CPU. On an RTX 4060, a 6.5s sentence takes 0.16s on the GPU versus ~2.4s on the CPU.
+
+- Clicking the mic while it speaks cuts the reply off.
+- The wake listener ignores the mic while the reply plays, so it doesn't hear itself.
+- Change the voice or speed with `VOICE` / `SPEED` in `tts.py`. Try one with `uv run python -m desktop_agent.tts "hello there"`.
 
 ## Conversation memory
 

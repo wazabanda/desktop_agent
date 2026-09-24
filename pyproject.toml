@@ -10,6 +10,9 @@ requires-python = ">=3.14"
 dependencies = [
     "evdev>=2.0.0",
     "faster-whisper>=1.2.1",
+    "kokoro-onnx>=0.6.1",
+    "nvidia-cublas-cu12>=12.9.2.10",
+    "onnxruntime-gpu[cuda,cudnn]>=1.30.0",
     "openai>=3.19.0",
     "pydantic-ai>=2.48.0",
     "pygobject>=3.58.0",
@@ -18,6 +21,10 @@ dependencies = [
 
 [project.scripts]
 desktop-agent = "desktop_agent.main:main"
+
+[tool.uv]
+# onnxruntime-gpu provides the same `onnxruntime` module (and still runs on CPU); both installed clobber each other
+override-dependencies = ["onnxruntime; sys_platform == 'never'"]
 
 [build-system]
 requires = ["uv_build>=0.12.0,<0.13.0"]

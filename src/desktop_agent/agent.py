@@ -32,7 +32,7 @@ PROVIDERS = {
 
 
 def load_settings() -> dict:
-    s = {"provider": "ollama", "model": MODEL, "keys": {}, "wake": False, "wake_phrase": "hi bits"}
+    s = {"provider": "ollama", "model": MODEL, "keys": {}, "wake": False, "wake_phrase": "hi bits", "speak": True, "gpu": True, "voice": "af_heart"}
     try:
         s |= json.loads(SETTINGS.read_text())
     except (OSError, ValueError):

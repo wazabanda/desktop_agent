@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 from PyQt6.QtCore import QByteArray, QEasingCurve, QRectF, Qt, QTimer, QVariantAnimation, pyqtSignal
@@ -11,10 +12,11 @@ from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtMultimedia import QAudioFormat, QAudioSource, QMediaDevices
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QMenu, QPushButton,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMenu,
+    QPushButton,
 )
 
-from desktop_agent import desktop
+from desktop_agent import desktop, tts
 from desktop_agent.agent import PROVIDERS, ask, forget, load_settings, save_settings
 
 SAMPLE_RATE = 16000  # what whisper expects
@@ -36,6 +38,8 @@ WAKE_WINDOW_S, WAKE_HOP_S = 2.5, 2.0  # whisper looks at 2.5s of audio every 2s 
 WAKE_MATCH = 0.8  # 0..1 letter similarity to the phrase; lower if it misses you, raise on false wakes
 SPEECH_RMS = 0.01  # calibration knob: mic level counted as speech; raise in a noisy room
 END_SILENCE_S, NO_SPEECH_S, MAX_RECORD_S = 1.5, 5.0, 30.0  # auto-stop for wake-started recordings
+FOLLOWUP_S = 10.0  # after a reply, listen this long for a follow-up before needing the wake phrase again
+GOODBYES = {"bye", "goodbye", "byebye", "thanksbye", "thankyoubye", "thatsall", "nevermind", "stop"}  # whole utterance
 BYTES_PER_S = SAMPLE_RATE * 2  # int16 mono
 
 
@@ -80,6 +84,7 @@ MIC_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="
 class MicButton(QPushButton):
     said = pyqtSignal(str)  # transcript, progress updates and replies, for the bubble
     woke = pyqtSignal()  # wake phrase heard (from the listener thread)
+    replied = pyqtSignal()  # agent answered (from the transcribe thread)
 
     def __init__(self):
         super().__init__()
@@ -113,13 +118,26 @@ class MicButton(QPushButton):
         self.wake_busy = False
         self.model = None
         self.model_lock = threading.Lock()  # listener and command transcription share one model
+        self.speaking = False  # replies being read out: the wake listener ignores the mic meanwhile
+        self.tts_loading = False
+        self.gpu = None  # device the models are loaded on; apply_settings (re)loads them
         self.woke.connect(lambda: self.recording or self._start(auto_stop=True))
-        threading.Thread(target=self._load_model, daemon=True).start()
+        self.replied.connect(lambda: self.recording or self._start(auto_stop=True, no_speech=FOLLOWUP_S))
         self.apply_settings()
 
-    def _load_model(self):
+    def _load_model(self, gpu: bool):
         from faster_whisper import WhisperModel
 
+        if gpu:
+            try:
+                _preload_cublas()
+                model = WhisperModel(MODEL_SIZE, device="cuda", compute_type="float16")
+                list(model.transcribe(np.zeros(SAMPLE_RATE, np.float32))[0])  # CUDA errors show up on first use
+                self.model = model
+                print("whisper on cuda", flush=True)
+                return
+            except Exception as e:  # no driver, libs missing, out of VRAM...
+                print(f"whisper can't use the GPU, using CPU: {e}", flush=True)
         self.model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
 
     def _pill(self):
@@ -176,6 +194,8 @@ class MicButton(QPushButton):
             self.update()
             if self.auto_stop:
                 self._check_silence(len(chunk), rms)
+        elif self.speaking:
+            self.wake_pcm.clear()  # don't scan our own voice for the wake phrase
         elif self.listening:
             self.wake_pcm.extend(chunk)
             window, hop = int(WAKE_WINDOW_S * BYTES_PER_S), int(WAKE_HOP_S * BYTES_PER_S)
@@ -207,7 +227,7 @@ class MicButton(QPushButton):
         else:
             self.quiet += nbytes
         if ((self.spoke and self.quiet >= END_SILENCE_S * BYTES_PER_S)
-                or (not self.spoke and self.rec_bytes >= NO_SPEECH_S * BYTES_PER_S)
+                or (not self.spoke and self.rec_bytes >= self.no_speech * BYTES_PER_S)
                 or self.rec_bytes >= MAX_RECORD_S * BYTES_PER_S):
             self._stop()
 
@@ -216,6 +236,15 @@ class MicButton(QPushButton):
         self.phrase = s["wake_phrase"]
         self.wake = WakeQueue(self.phrase)
         self.listening = bool(s["wake"])
+        self.speak = bool(s["speak"])
+        tts.VOICE = s["voice"]
+        if bool(s["gpu"]) != self.gpu:  # first run or toggled: (re)load both models on that device
+            self.gpu = bool(s["gpu"])
+            threading.Thread(target=self._load_model, args=(self.gpu,), daemon=True).start()
+            tts._kokoro, self.tts_loading = None, False
+        if self.speak and tts._kokoro is None and not self.tts_loading:
+            self.tts_loading = True
+            threading.Thread(target=tts.load, args=(self.gpu,), daemon=True).start()
         self._mic(self.listening or self.recording)
         self.update()
 
@@ -242,8 +271,9 @@ class MicButton(QPushButton):
     def toggle(self):
         self._stop() if self.recording else self._start(auto_stop=False)
 
-    def _start(self, auto_stop: bool):
-        self.recording, self.auto_stop = True, auto_stop
+    def _start(self, auto_stop: bool, no_speech: float = NO_SPEECH_S):
+        tts.stop()  # clicking the mic interrupts the reply being read out
+        self.recording, self.auto_stop, self.no_speech = True, auto_stop, no_speech
         self.pcm = bytearray()
         self.rec_bytes = self.quiet = 0
         self.spoke = False
@@ -269,10 +299,53 @@ class MicButton(QPushButton):
         if not text:
             return
         self.said.emit(f"› {text}")
+        if _goodbye(text):  # end the conversation turn: no agent call, no follow-up
+            self.said.emit("bye 👋")
+            self._say("Bye!")
+            return
         try:
-            self.said.emit(ask(text, self.said.emit))
+            reply = ask(text, self.said.emit)
         except Exception as e:  # ollama down, model missing, etc.
             self.said.emit(f"[agent error: {e}]")
+            return
+        self.said.emit(reply)
+        self._say(reply)  # blocks, so the follow-up below doesn't record our own voice
+        if self.listening and not _playing():
+            self.replied.emit()
+
+    def _say(self, text: str):
+        if not self.speak:
+            return
+        self.speaking = True
+        try:
+            tts.speak(text)
+        except Exception as e:  # pw-play missing, model failed to load, etc.
+            print(f"tts failed: {e}", flush=True)
+        finally:
+            self.speaking = False
+
+
+def _preload_cublas():
+    """ctranslate2 (whisper) dlopens libcublas.so.12; the nvidia-cublas-cu12 wheel isn't on the library path."""
+    import ctypes
+    import nvidia.cublas
+
+    lib = Path(nvidia.cublas.__path__[0], "lib")
+    for name in ("libcublasLt.so.12", "libcublas.so.12"):
+        ctypes.CDLL(str(lib / name), mode=ctypes.RTLD_GLOBAL)
+
+
+def _goodbye(text: str) -> bool:
+    # ponytail: exact match on the whole utterance, so "stop the music" still reaches the agent
+    return "".join(map(_word, text.split())) in GOODBYES
+
+
+def _playing() -> bool:
+    """Something is playing: the reply started media, and it would drown out a follow-up anyway."""
+    try:
+        return "Playing" in desktop._players().values()
+    except Exception:  # ponytail: no D-Bus/MPRIS -> assume silent
+        return False
 
 
 class Settings(QDialog):
@@ -302,6 +375,21 @@ class Settings(QDialog):
         self.phrase.setPlaceholderText("hi bits")
         form.addRow(self.wake)
         form.addRow("Wake phrase", self.phrase)
+        self.speak = QCheckBox("Read replies aloud (downloads a ~340MB voice model once)")
+        self.speak.setChecked(self.s["speak"])
+        form.addRow(self.speak)
+        self.voice = QComboBox()
+        self.voice.addItems(tts.VOICES)
+        self.voice.setCurrentText(self.s["voice"])
+        preview = QPushButton("Preview")
+        preview.clicked.connect(self._preview)
+        row = QHBoxLayout()
+        row.addWidget(self.voice, 1)
+        row.addWidget(preview)
+        form.addRow("Voice", row)
+        self.gpu = QCheckBox("Run speech models on the GPU (NVIDIA/CUDA, falls back to CPU)")
+        self.gpu.setChecked(self.s["gpu"])
+        form.addRow(self.gpu)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -311,6 +399,21 @@ class Settings(QDialog):
         self._suggest(self.s["provider"])
         self.model.setCurrentText(self.s["model"])
         self.setMinimumWidth(380)
+
+    def _preview(self):
+        voice = self.voice.currentText()
+
+        def say():
+            saved, tts.VOICE = tts.VOICE, voice  # only for this sample; Save is what keeps it
+            try:
+                tts.speak(f"Hi, I'm {voice.split('_')[1].title()}. This is how I'll read your replies.")
+            finally:
+                tts.VOICE = saved
+
+        tts.stop()
+        if tts._kokoro is None:
+            print("voice model not loaded yet (is Read replies aloud on?)", flush=True)
+        threading.Thread(target=say, daemon=True).start()
 
     def _suggest(self, provider):
         self.model.clear()
@@ -322,6 +425,9 @@ class Settings(QDialog):
         self.s["keys"] = {p: e.text().strip() for p, e in self.keys.items() if e.text().strip()}
         self.s["wake"] = self.wake.isChecked()
         self.s["wake_phrase"] = self.phrase.text().strip() or "hi bits"
+        self.s["speak"] = self.speak.isChecked()
+        self.s["voice"] = self.voice.currentText()
+        self.s["gpu"] = self.gpu.isChecked()
         save_settings(self.s)
         super().accept()
 
