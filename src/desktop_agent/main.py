@@ -1,3 +1,4 @@
+import difflib
 import json
 import subprocess
 import sys
@@ -10,7 +11,7 @@ from PyQt6.QtGui import QColor, QPainter
 from PyQt6.QtMultimedia import QAudioFormat, QAudioSource, QMediaDevices
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QMenu, QPushButton,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QMenu, QPushButton,
 )
 
 from desktop_agent import desktop
@@ -30,6 +31,44 @@ BUBBLE_GAP = 8  # px between bubble and mic
 FOLLOW_MS = 250  # how often the visible bubble re-checks the mic position
 MIC_TITLE, BUBBLE_TITLE = "desktop-agent-mic", "desktop-agent-bubble"
 SETTINGS_TITLE = "desktop-agent-settings"
+# always-listening mode
+WAKE_WINDOW_S, WAKE_HOP_S = 2.5, 2.0  # whisper looks at 2.5s of audio every 2s (0.5s overlap)
+WAKE_MATCH = 0.8  # 0..1 letter similarity to the phrase; lower if it misses you, raise on false wakes
+SPEECH_RMS = 0.01  # calibration knob: mic level counted as speech; raise in a noisy room
+END_SILENCE_S, NO_SPEECH_S, MAX_RECORD_S = 1.5, 5.0, 30.0  # auto-stop for wake-started recordings
+BYTES_PER_S = SAMPLE_RATE * 2  # int16 mono
+
+
+def _float(pcm: bytes) -> np.ndarray:
+    return np.frombuffer(pcm, np.int16).astype(np.float32) / 32768
+
+
+def _rms(pcm: bytes) -> float:
+    return float(np.sqrt(np.mean(_float(pcm) ** 2)))
+
+
+def _word(w: str) -> str:
+    return "".join(c for c in w.lower() if c.isalnum())
+
+
+class WakeQueue:
+    """Rolling queue of the last words heard; fires once when it contains the wake phrase."""
+
+    def __init__(self, phrase: str):
+        self.phrase = "".join(_word(w) for w in phrase.split())
+        n = len(phrase.split())
+        self.sizes = range(max(1, n - 1), n + 2)  # whisper may merge or split words: "hibits", "hi bit s"
+        self.words: deque[str] = deque(maxlen=n + 2)
+
+    def heard(self, text: str) -> bool:
+        self.words.extend(w for w in map(_word, text.split()) if w)
+        words = list(self.words)
+        spans = ("".join(words[i:i + k]) for k in self.sizes for i in range(len(words) - k + 1))
+        # compare letters, not words: whisper spells a made-up name loosely ("Hi, Bitz!", "hibbits")
+        if self.phrase and any(difflib.SequenceMatcher(None, s, self.phrase).ratio() >= WAKE_MATCH for s in spans):
+            self.words.clear()  # don't fire again on the same words
+            return True
+        return False
 
 # Lucide "mic" icon (ISC license)
 MIC_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="white"
@@ -40,6 +79,7 @@ MIC_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="
 
 class MicButton(QPushButton):
     said = pyqtSignal(str)  # transcript, progress updates and replies, for the bubble
+    woke = pyqtSignal()  # wake phrase heard (from the listener thread)
 
     def __init__(self):
         super().__init__()
@@ -65,9 +105,17 @@ class MicButton(QPushButton):
         fmt.setChannelCount(1)
         fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
         self.source = QAudioSource(QMediaDevices.defaultAudioInput(), fmt)
-        self.buffer = None
+        self.buffer = None  # audio device while the mic is open (recording or listening)
+        self.recording = False
+        self.auto_stop = False  # wake-started recordings end on silence
+        self.listening = False
+        self.wake_pcm = bytearray()
+        self.wake_busy = False
         self.model = None
+        self.model_lock = threading.Lock()  # listener and command transcription share one model
+        self.woke.connect(lambda: self.recording or self._start(auto_stop=True))
         threading.Thread(target=self._load_model, daemon=True).start()
+        self.apply_settings()
 
     def _load_model(self):
         from faster_whisper import WhisperModel
@@ -99,11 +147,14 @@ class MicButton(QPushButton):
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#d33" if self.buffer is not None else "#333"))
+        p.setBrush(QColor("#d33" if self.recording else "#333"))
         pill = self._pill()
         p.drawRoundedRect(pill, SIZE / 2, SIZE / 2)
-        if self.buffer is None:
+        if not self.recording:
             self.mic.render(p, QRectF((WIDE - SIZE) / 2 + 14, 14, SIZE - 28, SIZE - 28))
+            if self.listening:  # privacy cue: the mic is open, waiting for the wake phrase
+                p.setBrush(QColor("#3c3"))
+                p.drawEllipse(QRectF(WIDE / 2 + 12, 8, 8, 8))
             return
         # waveform: as many recent levels as fit the current width, newest on the right
         p.setBrush(QColor("white"))
@@ -116,16 +167,71 @@ class MicButton(QPushButton):
 
     def _on_audio(self):
         chunk = self.buffer.readAll().data()
-        self.pcm.extend(chunk)
-        if chunk:
-            samples = np.frombuffer(chunk, np.int16).astype(np.float32) / 32768
-            self.levels.append(min(1.0, float(np.sqrt(np.mean(samples**2))) * WAVE_GAIN))
+        if not chunk:
+            return
+        rms = _rms(chunk)
+        if self.recording:
+            self.pcm.extend(chunk)
+            self.levels.append(min(1.0, rms * WAVE_GAIN))
             self.update()
+            if self.auto_stop:
+                self._check_silence(len(chunk), rms)
+        elif self.listening:
+            self.wake_pcm.extend(chunk)
+            window, hop = int(WAKE_WINDOW_S * BYTES_PER_S), int(WAKE_HOP_S * BYTES_PER_S)
+            if len(self.wake_pcm) >= window:
+                audio = bytes(self.wake_pcm[:window])
+                del self.wake_pcm[:hop]
+                # skip quiet windows (most of the day) and windows arriving while whisper is still busy
+                if not self.wake_busy and self.model is not None and _rms(audio) >= SPEECH_RMS:
+                    self.wake_busy = True
+                    threading.Thread(target=self._listen, args=(audio,), daemon=True).start()
+
+    def _listen(self, audio: bytes):
+        try:
+            with self.model_lock:
+                segments, _ = self.model.transcribe(
+                    _float(audio), beam_size=1, vad_filter=True, condition_on_previous_text=False,
+                    hotwords=self.phrase,  # nudges whisper towards spelling the phrase the way you set it
+                )
+                text = " ".join(s.text.strip() for s in segments)
+            if text and self.wake.heard(text):
+                self.woke.emit()
+        finally:
+            self.wake_busy = False
+
+    def _check_silence(self, nbytes: int, rms: float):
+        self.rec_bytes += nbytes
+        if rms >= SPEECH_RMS:
+            self.spoke, self.quiet = True, 0
+        else:
+            self.quiet += nbytes
+        if ((self.spoke and self.quiet >= END_SILENCE_S * BYTES_PER_S)
+                or (not self.spoke and self.rec_bytes >= NO_SPEECH_S * BYTES_PER_S)
+                or self.rec_bytes >= MAX_RECORD_S * BYTES_PER_S):
+            self._stop()
+
+    def apply_settings(self):
+        s = load_settings()
+        self.phrase = s["wake_phrase"]
+        self.wake = WakeQueue(self.phrase)
+        self.listening = bool(s["wake"])
+        self._mic(self.listening or self.recording)
+        self.update()
+
+    def _mic(self, on: bool):
+        """Open/close the audio device; it stays open while recording or listening."""
+        if on and self.buffer is None:
+            self.buffer = self.source.start()  # pull-mode QIODevice
+            self.buffer.readyRead.connect(self._on_audio)
+        elif not on and self.buffer is not None:
+            self.source.stop()
+            self.buffer = None
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
         menu.addAction("New conversation", lambda: (forget(), self.said.emit("[new conversation]")))
-        menu.addAction("Settings…", lambda: Settings().exec())
+        menu.addAction("Settings…", lambda: Settings().exec() and self.apply_settings())
         menu.addAction("Quit", QApplication.quit)
         menu.exec(event.globalPos())
 
@@ -134,26 +240,32 @@ class MicButton(QPushButton):
         self.move(geo.center().x() - self.width() // 2, geo.bottom() - self.height() - 20)
 
     def toggle(self):
-        if self.buffer is None:
-            self.buffer = self.source.start()  # pull-mode QIODevice
-            self.pcm = bytearray()
-            self.levels.extend([0.0] * BARS)
-            self.buffer.readyRead.connect(self._on_audio)
-            self._animate_to(WIDE)
-            return
+        self._stop() if self.recording else self._start(auto_stop=False)
+
+    def _start(self, auto_stop: bool):
+        self.recording, self.auto_stop = True, auto_stop
+        self.pcm = bytearray()
+        self.rec_bytes = self.quiet = 0
+        self.spoke = False
+        self.levels.extend([0.0] * BARS)
+        self._mic(True)
+        self._animate_to(WIDE)
+
+    def _stop(self):
         self.pcm.extend(self.buffer.readAll().data())
-        self.source.stop()
-        self.buffer = None
+        self.recording = False
+        self.wake_pcm.clear()  # don't scan the command itself for the wake phrase
+        self._mic(self.listening)
         self._animate_to(SIZE)
-        audio = np.frombuffer(bytes(self.pcm), np.int16).astype(np.float32) / 32768
-        threading.Thread(target=self._transcribe, args=(audio,), daemon=True).start()
+        threading.Thread(target=self._transcribe, args=(_float(bytes(self.pcm)),), daemon=True).start()
 
     def _transcribe(self, audio):
         if self.model is None:
             self.said.emit("[model still loading, try again]")
             return
-        segments, _ = self.model.transcribe(audio, vad_filter=True)
-        text = " ".join(s.text.strip() for s in segments)
+        with self.model_lock:
+            segments, _ = self.model.transcribe(audio, vad_filter=True)
+            text = " ".join(s.text.strip() for s in segments)
         if not text:
             return
         self.said.emit(f"› {text}")
@@ -184,6 +296,12 @@ class Settings(QDialog):
             self.keys[p] = QLineEdit(self.s["keys"].get(p, ""))
             self.keys[p].setEchoMode(QLineEdit.EchoMode.Password)
             form.addRow(f"{p} API key", self.keys[p])
+        self.wake = QCheckBox("Always listening (say the wake phrase instead of clicking)")
+        self.wake.setChecked(self.s["wake"])
+        self.phrase = QLineEdit(self.s["wake_phrase"])
+        self.phrase.setPlaceholderText("hi bits")
+        form.addRow(self.wake)
+        form.addRow("Wake phrase", self.phrase)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -202,6 +320,8 @@ class Settings(QDialog):
         self.s["provider"] = self.provider.currentText()
         self.s["model"] = self.model.currentText().strip() or PROVIDERS[self.s["provider"]][0]
         self.s["keys"] = {p: e.text().strip() for p, e in self.keys.items() if e.text().strip()}
+        self.s["wake"] = self.wake.isChecked()
+        self.s["wake_phrase"] = self.phrase.text().strip() or "hi bits"
         save_settings(self.s)
         super().accept()
 

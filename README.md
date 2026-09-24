@@ -21,6 +21,7 @@ Early work in progress.
 | Tool: `open_app` (launch installed apps by spoken name) | ✅ done |
 | niri window rule setup | ✅ done |
 | Mic and bubble follow you to whichever workspace/monitor you focus | ✅ done |
+| Always-listening mode with a wake phrase (off by default, toggle in Settings) | ✅ done |
 | Tools: windows (`list_windows`, `focus_window`), `open_url`, keyboard (`press_keys`, `type_text`) | ✅ done |
 | Tools: app UI via accessibility tree (`list_elements`, `click_element`, `type_into`) | ✅ done |
 | Conversation memory across requests (last 20, reset from the right-click menu) | ✅ done |
@@ -82,9 +83,22 @@ tests/
   test_find_app.py  # app-name matching, run with `uv run python tests/test_find_app.py`
   test_keys.py      # key-name / character mapping
   test_history.py   # conversation memory and trimming (stub model, no LLM needed)
+  test_wake.py      # wake-phrase queue matching
 scripts/
   niri-setup.sh  # installs the niri window rule
 ```
+
+## Always-listening mode
+
+Turn on **Always listening** in Settings (right-click the mic) and set a wake phrase (default "hi bits"). A green dot on the mic shows it is listening.
+
+- The mic stays open, and every 2 seconds whisper transcribes the last 2.5s locally. Quiet stretches are skipped, so it uses almost no CPU while the room is silent.
+- The words go into a small rolling queue. When the queue contains your phrase, recording starts, the same as clicking. The match is on letters, so "Hi, Bitz" or "hibits" still count, and a phrase split across two windows is caught.
+- **Nothing is sent to the LLM until the wake phrase is heard.** Only the recording after it goes to the agent.
+- A wake-started recording stops by itself 1.5s after you stop talking. It also stops after 5s if you say nothing, or after 30s at most. Clicked recordings still wait for a second click.
+- Wait for the mic to turn red before giving the command. Wake-up takes about half a second after the phrase.
+
+Tuning knobs at the top of `main.py`: `SPEECH_RMS` (raise it in a noisy room), `WAKE_MATCH` (lower it if you get missed wakes, raise it if you get false ones) and `END_SILENCE_S`.
 
 ## Conversation memory
 

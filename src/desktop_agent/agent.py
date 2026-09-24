@@ -32,7 +32,7 @@ PROVIDERS = {
 
 
 def load_settings() -> dict:
-    s = {"provider": "ollama", "model": MODEL, "keys": {}}
+    s = {"provider": "ollama", "model": MODEL, "keys": {}, "wake": False, "wake_phrase": "hi bits"}
     try:
         s |= json.loads(SETTINGS.read_text())
     except (OSError, ValueError):
@@ -70,7 +70,8 @@ agent = Agent(
         "You are a desktop assistant on Linux (niri compositor). Be brief. On multi-step tasks, call "
         "print_to_ui with short progress updates. Your final answer is shown to the user automatically.\n"
         "To operate apps, prefer the most direct tool: open_app / open_url / focus_window first; keyboard "
-        "shortcuts (press_keys, type_text) when you know them; otherwise list_elements to see a window's "
+        "shortcuts (press_keys, type_text) when you know them; media for music/video playback (Spotify has no "
+        "element tree, so use media there); otherwise list_elements to see a window's "
         "buttons and fields, then click_element / type_into by number. Element numbers expire when the "
         "window changes, so list again after navigating. Keyboard tools act on the window the user last "
         "used unless you pass window_id. Never submit, send, buy or delete anything without the user "

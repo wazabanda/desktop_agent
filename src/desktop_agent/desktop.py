@@ -1,4 +1,5 @@
-"""Desktop tools: windows via niri IPC, keyboard via a uinput device, app UIs via the AT-SPI tree."""
+"""Desktop tools: windows via niri IPC, keyboard via a uinput device, app UIs via the AT-SPI tree,
+media players via MPRIS."""
 
 import json
 import subprocess
@@ -10,7 +11,7 @@ from evdev import UInput, ecodes
 from pydantic_ai.toolsets import FunctionToolset
 
 gi.require_version("Atspi", "2.0")
-from gi.repository import Atspi, GLib  # noqa: E402
+from gi.repository import Atspi, Gio, GLib  # noqa: E402
 
 toolset = FunctionToolset()
 OURS = "desktop-agent"  # our own app-id: never a target for keys
@@ -267,3 +268,80 @@ def type_into(n: int, text: str, replace: bool = True) -> str:
         _combo([ecodes.KEY_LEFTCTRL, ecodes.KEY_A])
     _type(text)
     return f"Typed into {_describe(el)}"
+
+
+# --- media players (MPRIS) ----------------------------------------------------------------------
+
+MPRIS = "org.mpris.MediaPlayer2."
+MEDIA_ACTIONS = {"play": "Play", "pause": "Pause", "play_pause": "PlayPause", "next": "Next",
+                 "previous": "Previous", "stop": "Stop"}
+
+
+def _dbus(dest: str, path: str, iface: str, method: str, args: GLib.Variant | None = None) -> tuple:
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    return bus.call_sync(dest, path, iface, method, args, None, Gio.DBusCallFlags.NONE, 2000, None).unpack()
+
+
+def _player_prop(player: str, name: str):
+    return _dbus(MPRIS + player, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties", "Get",
+                 GLib.Variant("(ss)", ("org.mpris.MediaPlayer2.Player", name)))[0]
+
+
+def _players() -> dict[str, str]:
+    """{bus name suffix: PlaybackStatus}, e.g. {"spotify": "Playing", "firefox.instance_1_42": "Paused"}."""
+    names = _dbus("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ListNames")[0]
+    out = {}
+    for n in sorted(names):
+        if n.startswith(MPRIS):
+            try:
+                out[n.removeprefix(MPRIS)] = _player_prop(n.removeprefix(MPRIS), "PlaybackStatus")
+            except GLib.Error:
+                continue  # player quit between ListNames and Get
+    return out
+
+
+def _choose(players: dict[str, str], query: str) -> str:
+    """Player whose name contains query, else the playing one, else a paused one, else any."""
+    if not players:
+        raise LookupError("no media player running (Spotify, a browser tab with audio, mpv...)")
+    if query:
+        hits = [p for p in players if query.lower() in p.lower()]
+        if not hits:
+            raise LookupError(f"no player matching {query!r}; running: {', '.join(players)}")
+        return hits[0]
+    rank = {"Playing": 0, "Paused": 1}
+    return min(players, key=lambda p: rank.get(players[p], 2))
+
+
+def _now(player: str, status: str) -> str:
+    try:
+        meta = _player_prop(player, "Metadata")
+    except GLib.Error:
+        meta = {}
+    title, album = meta.get("xesam:title", ""), meta.get("xesam:album", "")
+    artist = ", ".join(meta.get("xesam:artist") or [])
+    song = " — ".join(filter(None, [title, artist, album])) or "nothing loaded"
+    return f"{player}: {status}: {song}"
+
+
+@toolset.tool_plain
+def media(action: str = "status", player: str = "", uri: str = "") -> str:
+    """Control music/video players (Spotify, browser tabs, mpv...) without touching their window.
+    action: status, play, pause, play_pause, next, previous, stop, or open (plays `uri`, e.g. a
+    "spotify:track:<id>" or "spotify:search:<words>" URI in Spotify).
+    player: part of the player name like "spotify"; default is the one currently playing."""
+    players = _players()
+    if action == "status":
+        return "\n".join(_now(p, s) for p, s in players.items()) or "No media player running"
+    name = _choose(players, player)
+    path, iface = "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player"
+    if action == "open":
+        if not uri:
+            raise ValueError("open needs a uri")
+        _dbus(MPRIS + name, path, iface, "OpenUri", GLib.Variant("(s)", (uri,)))
+    elif action in MEDIA_ACTIONS:
+        _dbus(MPRIS + name, path, iface, MEDIA_ACTIONS[action])
+    else:
+        raise ValueError(f"unknown action {action!r}")
+    time.sleep(0.3)  # let the player update status/metadata before we report it
+    return _now(name, _player_prop(name, "PlaybackStatus"))
