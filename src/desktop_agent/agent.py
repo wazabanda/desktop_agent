@@ -65,6 +65,7 @@ def build_model(s: dict) -> OpenAIChatModel:
 @dataclass
 class UI:
     say: Callable[[str], None] = print  # main.py passes a Qt signal emit (thread-safe)
+    fresh: bool = False  # set by new_conversation: drop the history once this run ends
 
 
 agent = Agent(
@@ -100,6 +101,14 @@ def print_to_ui(ctx: RunContext[UI], message: str) -> str:
     """Show a short progress update to the user in the chat bubble."""
     ctx.deps.say(message)
     return "shown"
+
+
+@agent.tool
+def new_conversation(ctx: RunContext[UI]) -> str:
+    """Start a new chat and forget everything said so far. Use when the user asks for a new session,
+    a fresh start, or to clear/reset the context."""
+    ctx.deps.fresh = True  # ponytail: applied after the run; ask() holds _lock, so forget() here would deadlock
+    return "Context will be cleared when this reply ends."
 
 
 App = tuple[str, Path]  # (display name, .desktop path)
@@ -230,11 +239,13 @@ def ask(prompt: str, say: Callable[[str], None] = print) -> str:
     with _lock:
         try:
             # settings re-read every ask, so dialog changes apply without a restart
-            result = agent.run_sync(prompt, model=build_model(load_settings()), deps=UI(say), message_history=_history)
+            ui = UI(say)
+            result = agent.run_sync(prompt, model=build_model(load_settings()), deps=ui, message_history=_history)
         except desktop.Dangerous as e:  # the whole run stops; history stays as it was, so it isn't retried
             print(f"blocked: {e}", flush=True)
             return BLOCKED
-        _history = compact(result.all_messages())  # a failed run raises above and leaves history as it was
+        # a failed run raises above and leaves history as it was
+        _history = [] if ui.fresh else compact(result.all_messages())
     return result.output
 
 

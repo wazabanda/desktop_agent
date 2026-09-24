@@ -28,6 +28,20 @@ with a.agent.override(model=FunctionModel(fake)):
     a.forget()
     assert a._history == []
 
+
+def resetter(messages, info):
+    """Calls new_conversation when asked to start over."""
+    if messages[-1].parts[-1].part_kind == "user-prompt" and messages[-1].parts[-1].content == "start over":
+        return ModelResponse(parts=[ToolCallPart("new_conversation", {})])
+    return ModelResponse(parts=[TextPart("ok")])
+
+
+with a.agent.override(model=FunctionModel(resetter)):
+    a.ask("make hello.py", say=lambda _: None)
+    assert a._history
+    a.ask("start over", say=lambda _: None)  # the agent chose to clear its own context
+    assert a._history == []
+
 # long tool output (e.g. an element list) is cut, the short action log survives untouched
 long, short = "[0] button 'x'\n" * 100, "Typed 20 chars in window 7 (ghostty: ~)"
 msgs: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart("hi")]),
