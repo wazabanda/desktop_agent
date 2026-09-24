@@ -5,15 +5,20 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import ModelMessage, ModelRequest, ToolReturnPart, UserPromptPart
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.deepseek import DeepSeekProvider
 from pydantic_ai.providers.moonshotai import MoonshotAIProvider
 from pydantic_ai.providers.ollama import OllamaProvider
+
+from desktop_agent import desktop
 
 MODEL = os.environ.get("AGENT_MODEL", "gemma4:e4b")  # any tool-capable model from `ollama list`
 OLLAMA_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
@@ -60,9 +65,16 @@ class UI:
 
 agent = Agent(
     deps_type=UI,
+    toolsets=[desktop.toolset],
     instructions=(
-        "You are a desktop assistant. Be brief. On multi-step tasks, call print_to_ui "
-        "with short progress updates. Your final answer is shown to the user automatically."
+        "You are a desktop assistant on Linux (niri compositor). Be brief. On multi-step tasks, call "
+        "print_to_ui with short progress updates. Your final answer is shown to the user automatically.\n"
+        "To operate apps, prefer the most direct tool: open_app / open_url / focus_window first; keyboard "
+        "shortcuts (press_keys, type_text) when you know them; otherwise list_elements to see a window's "
+        "buttons and fields, then click_element / type_into by number. Element numbers expire when the "
+        "window changes, so list again after navigating. Keyboard tools act on the window the user last "
+        "used unless you pass window_id. Never submit, send, buy or delete anything without the user "
+        "explicitly asking for it."
     ),
 )
 
@@ -75,6 +87,7 @@ def print_to_ui(ctx: RunContext[UI], message: str) -> str:
 
 
 App = tuple[str, Path]  # (display name, .desktop path)
+APP_WAIT_S = 10  # how long open_app waits for the new window
 
 
 def installed_apps() -> tuple[dict[str, App], dict[str, App]]:
@@ -134,19 +147,60 @@ def open_app(name: str) -> str:
         guesses = difflib.get_close_matches(_norm(name), names, n=5, cutoff=0.4)
         return f"No app named {name!r}. Closest: {', '.join(names[g][0] for g in guesses) or 'none'}"
     title, path = matches[0]
+    before = {w["id"] for w in desktop._windows()}
     # own session so the app outlives us; gio handles Exec field codes, Terminal=true, etc.
     subprocess.Popen(
         ["gio", "launch", str(path)],
         start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    return f"Launched {title}"
+    # wait for the window, so a following type_text can't land in the previously focused app
+    deadline = time.monotonic() + APP_WAIT_S
+    while time.monotonic() < deadline:
+        new = [w for w in desktop._windows() if w["id"] not in before]
+        if new:
+            return f"Launched {title} as window {new[0]['id']} ({new[0]['title']})"
+        time.sleep(0.2)
+    return f"Launched {title}, but no new window appeared within {APP_WAIT_S}s (it may reuse an existing one)"
+
+
+HISTORY_TURNS = 20  # past requests the agent remembers
+OLD_TOOL_CHARS = 300  # tool output from past turns is cut to this; element lists etc. are stale anyway
+_history: list[ModelMessage] = []
+_lock = threading.Lock()  # one run at a time: a second request waits instead of forking the history
+
+
+def compact(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """Keep the last HISTORY_TURNS requests, with long tool outputs shortened."""
+    starts = [i for i, m in enumerate(messages)
+              if isinstance(m, ModelRequest) and any(isinstance(p, UserPromptPart) for p in m.parts)]
+    if len(starts) > HISTORY_TURNS:
+        messages = messages[starts[-HISTORY_TURNS]:]  # cut at a user turn so tool call/return pairs stay whole
+
+    def shorten(p):
+        if isinstance(p, ToolReturnPart) and isinstance(p.content, str) and len(p.content) > OLD_TOOL_CHARS:
+            return replace(p, content=p.content[:OLD_TOOL_CHARS] + " …(trimmed)")
+        return p
+
+    return [replace(m, parts=[shorten(p) for p in m.parts]) if isinstance(m, ModelRequest) else m
+            for m in messages]
+
+
+def forget() -> None:
+    """Start a new conversation."""
+    with _lock:
+        _history.clear()
 
 
 def ask(prompt: str, say: Callable[[str], None] = print) -> str:
+    global _history
     print(f"asking agent {prompt}")
-    # settings re-read every ask, so dialog changes apply without a restart
-    return agent.run_sync(prompt, model=build_model(load_settings()), deps=UI(say)).output
+    with _lock:
+        # settings re-read every ask, so dialog changes apply without a restart
+        result = agent.run_sync(prompt, model=build_model(load_settings()), deps=UI(say), message_history=_history)
+        _history = compact(result.all_messages())  # a failed run raises above and leaves history as it was
+    return result.output
 
 
 if __name__ == "__main__":
+    desktop.enable_accessibility()
     print(ask(" ".join(sys.argv[1:]) or "Say hi."))
