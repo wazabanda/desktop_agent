@@ -12,7 +12,22 @@
       "Bash(python -c \"import json,sys; [print\\(json.dumps\\(w\\)\\) for w in json.load\\(sys.stdin\\)[:2]]\")",
       "Bash(python -)",
       "Bash(grep -hE \"^\\(Keywords|GenericName\\)=\" /usr/share/applications/code.desktop /usr/share/applications/firefox.desktop /usr/share/applications/*lacritty*.desktop 2>/dev/null)",
-      "Read(//usr/share/applications/**)"
+      "Read(//usr/share/applications/**)",
+      "Read(//dev/**)",
+      "Bash(python3 -c \"import pyatspi\")",
+      "Bash(busctl --user list)",
+      "Bash(pacman -Q python-gobject at-spi2-core python-atspi)",
+      "Read(//usr/lib/girepository-1.0/**)",
+      "Bash(python -m json.tool)",
+      "Bash(python -c \"import json,sys; [print\\(k, v['logical']\\) for k,v in json.load\\(sys.stdin\\).items\\(\\)]\")",
+      "Bash(python -c \"import json,sys; [print\\(w['id'],w['output'],w['is_active'],w['is_focused']\\) for w in json.load\\(sys.stdin\\)]\")",
+      "Bash(python -c \"import json,sys; [print\\(w['id'],w['app_id'],w['pid'],w['workspace_id'],w['title'][:50]\\) for w in json.load\\(sys.stdin\\)]\")",
+      "Bash(busctl --user get-property org.a11y.Bus /org/a11y/bus org.a11y.Status IsEnabled ScreenReaderEnabled)",
+      "Bash(busctl --user set-property org.a11y.Bus /org/a11y/bus org.a11y.Status IsEnabled b true)",
+      "Bash(python -c \"import json,sys; print\\('still focused:', json.load\\(sys.stdin\\)['title'][:40]\\)\")",
+      "Bash(python -c \"import json,sys; print\\('still focused:', json.load\\(sys.stdin\\)['app_id']\\)\")",
+      "Bash(PYDANTIC_AI_NO_BANNER=1 uv run python tests/test_history.py)",
+      "Read(//usr/share/doc/niri/**)"
     ]
   }
 }

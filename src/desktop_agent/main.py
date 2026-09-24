@@ -13,7 +13,8 @@ from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QMenu, QPushButton,
 )
 
-from desktop_agent.agent import PROVIDERS, ask, load_settings, save_settings
+from desktop_agent import desktop
+from desktop_agent.agent import PROVIDERS, ask, forget, load_settings, save_settings
 
 SAMPLE_RATE = 16000  # what whisper expects
 MODEL_SIZE = "base.en"
@@ -123,6 +124,7 @@ class MicButton(QPushButton):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
+        menu.addAction("New conversation", lambda: (forget(), self.said.emit("[new conversation]")))
         menu.addAction("Settings…", lambda: Settings().exec())
         menu.addAction("Quit", QApplication.quit)
         menu.exec(event.globalPos())
@@ -279,14 +281,40 @@ class Bubble(QLabel):
         super().paintEvent(event)
 
 
+def follow_workspaces(app_id: str = desktop.OURS) -> None:
+    """Pull our windows onto whichever workspace gets focused: niri has no sticky windows."""
+    # ponytail: one long-lived event stream; if niri restarts the loop ends and windows stop following
+    stream = subprocess.Popen(["niri", "msg", "--json", "event-stream"], stdout=subprocess.PIPE, text=True)
+    for line in stream.stdout or []:
+        ev = json.loads(line).get("WorkspaceActivated")
+        if not ev or not ev["focused"]:
+            continue
+        try:
+            spaces = {w["id"]: w for w in json.loads(desktop._niri("--json", "workspaces"))}
+            target = spaces[ev["id"]]
+            for win in json.loads(desktop._niri("--json", "windows")):
+                if win["app_id"] != app_id or win["workspace_id"] == target["id"]:
+                    continue
+                if spaces[win["workspace_id"]]["output"] != target["output"]:
+                    # lands on that monitor's active workspace, which is the one just focused
+                    desktop._niri("action", "move-window-to-monitor", "--id", str(win["id"]), target["output"])
+                else:
+                    desktop._niri("action", "move-window-to-workspace", "--window-id", str(win["id"]),
+                                  "--focus", "false", str(target["idx"]))
+        except (subprocess.SubprocessError, KeyError, ValueError) as e:
+            print(f"workspace follow failed: {e}", flush=True)  # skip this switch, keep listening
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     #Wayland ignores move(); on niri a window-rule on this app-id floats it bottom-center.
     app.setDesktopFileName("desktop-agent")
+    desktop.enable_accessibility()  # apps launched from now on expose their UI to list_elements
     button = MicButton()
     bubble = Bubble()
     button.said.connect(bubble.say)
     button.show()
     button.place()
+    threading.Thread(target=follow_workspaces, daemon=True).start()
     print("UI initialized", flush=True)
     sys.exit(app.exec())

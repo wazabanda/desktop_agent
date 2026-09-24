@@ -20,7 +20,12 @@ Early work in progress.
 | Agent loop over Ollama | ✅ done |
 | Tool: `open_app` (launch installed apps by spoken name) | ✅ done |
 | niri window rule setup | ✅ done |
-| Tools: niri control, system info, search, safe bash | 🚧 planned |
+| Mic and bubble follow you to whichever workspace/monitor you focus | ✅ done |
+| Tools: windows (`list_windows`, `focus_window`), `open_url`, keyboard (`press_keys`, `type_text`) | ✅ done |
+| Tools: app UI via accessibility tree (`list_elements`, `click_element`, `type_into`) | ✅ done |
+| Conversation memory across requests (last 20, reset from the right-click menu) | ✅ done |
+| Screenshot + numbered-box fallback for apps without an accessibility tree | 🚧 planned |
+| Tools: system info, search, safe bash | 🚧 planned |
 | Chat bubble above the mic for transcript, progress and replies | ✅ done |
 
 ## Requirements
@@ -71,16 +76,37 @@ uv run python -m desktop_agent.agent "what's using the most memory?"
 ```
 src/desktop_agent/
   main.py    # Qt mic button, audio capture, whisper transcription
-  agent.py   # pydantic-ai agent + tools
+  agent.py   # pydantic-ai agent, settings, open_app
+  desktop.py # desktop tools: niri windows, uinput keyboard, AT-SPI elements
 tests/
   test_find_app.py  # app-name matching, run with `uv run python tests/test_find_app.py`
+  test_keys.py      # key-name / character mapping
+  test_history.py   # conversation memory and trimming (stub model, no LLM needed)
 scripts/
   niri-setup.sh  # installs the niri window rule
 ```
 
+## Conversation memory
+
+The agent remembers the last 20 requests of the session, so follow-ups work: "write a hello world in vim" followed by "run the program" types `python3 hello.py` into the same terminal. Old tool output such as element lists is trimmed to its first lines; what the agent did and in which window is kept. Right-click the mic and pick **New conversation** to start fresh. Memory is not saved when the app quits.
+
+## Operating apps
+
+The agent drives apps in three ways, most reliable first:
+
+1. **Direct commands**: launch apps, open URLs, focus windows through niri.
+2. **Keyboard**: key combos and typing through a virtual uinput keyboard. You need to be in the `uinput` group. Typing assumes the US layout and ASCII.
+3. **Accessibility tree** (AT-SPI): `list_elements` returns a window's buttons, links and fields as a numbered list. `click_element` triggers the element's own action and `type_into` types into a field, with no mouse or coordinates involved.
+
+On startup desktop-agent turns on the session's accessibility flag, as a screen reader would. GTK and Qt apps pick it up right away. Browsers only check it at startup, so restart Firefox or Chrome once after launching desktop-agent. VS Code and other Electron apps need `--force-renderer-accessibility`.
+
+Large hosted models handle multi-step UI tasks well. Small local models (4B–9B) handle single tool calls but often misread longer tool output.
+
 ## Safety
 
 The agent acts on your real machine, so shell access is limited by design. The planned bash tool checks every command against an allow/deny list in code before it runs. Destructive operations, privilege escalation and writes outside expected locations get blocked there, so the model can't talk its way around the check. Keep this in mind when you add tools: a new tool should expose the narrowest capability that does the job.
+
+The keyboard tools are the exception: they can type anything into any window, including a terminal, so they effectively bypass any shell allow-list. The agent is told never to submit, send, buy or delete without being asked, but only the prompt enforces that. There is no hard check. Treat the model you pick accordingly.
 
 ## AI disclosure
 
